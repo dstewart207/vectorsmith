@@ -140,7 +140,10 @@ def tdr_impedance_response(
     )
     gamma = np.asarray(gamma, dtype=complex)
     impedance = np.real(gamma_to_impedance(gamma, z_ref_ohms))
-    return np.asarray(t_s, dtype=float), impedance
+    t_s = np.asarray(t_s, dtype=float)
+    if t_s.size:
+        t_s = t_s - float(np.min(t_s))
+    return t_s, impedance
 
 
 def trace_x_values(

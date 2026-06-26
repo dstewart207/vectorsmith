@@ -45,4 +45,6 @@ def test_tdr_response_returns_time_and_impedance():
     net = load_touchstone(FIXTURES / "oneport.s1p").network
     t, z = tdr_impedance_response(net, 0, 0, z_ref_ohms=50.0)
     assert len(t) == len(z)
+    assert t[0] == pytest.approx(0.0)
+    assert t.min() == pytest.approx(0.0)
     assert np.isfinite(z).all()
