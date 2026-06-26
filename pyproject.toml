@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vectorsmith"
+version = "0.1.0"
+description = "Desktop Touchstone (.sNp) file viewer using scikit-rf"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "scikit-rf>=1.5",
+  "numpy>=1.24",
+  "matplotlib>=3.8",
+  "PyQt6>=6.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+vectorsmith = "vectorsmith.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+vectorsmith = ["assets/*.png"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
