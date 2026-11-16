@@ -138,11 +138,13 @@ def tdr_impedance_response(
         pad=pad,
         squeeze=True,
     )
-    gamma = np.asarray(gamma, dtype=complex)
-    impedance = np.real(gamma_to_impedance(gamma, z_ref_ohms))
+    # skrf returns an fftshifted waveform (t=0 at center). Undo that so the
+    # causal TDR response starts at t=0 instead of mid-window.
+    gamma = np.fft.ifftshift(np.asarray(gamma, dtype=complex))
     t_s = np.asarray(t_s, dtype=float)
-    if t_s.size:
-        t_s = t_s - float(np.min(t_s))
+    dt = float(t_s[1] - t_s[0]) if t_s.size > 1 else 0.0
+    t_s = np.arange(t_s.size, dtype=float) * dt
+    impedance = np.real(gamma_to_impedance(gamma, z_ref_ohms))
     return t_s, impedance
 
 

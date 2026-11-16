@@ -2,6 +2,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import skrf as rf
 
 from vectorsmith.loader import load_touchstone
 from vectorsmith.plot_kinds import PlotKind
@@ -48,3 +49,24 @@ def test_tdr_response_returns_time_and_impedance():
     assert t[0] == pytest.approx(0.0)
     assert t.min() == pytest.approx(0.0)
     assert np.isfinite(z).all()
+
+
+def test_tdr_response_places_reflection_at_causal_time():
+    """Regression: skrf step_response is fftshifted; TDR must start at t=0."""
+    one_way_delay_s = 5e-9
+    expected_peak_s = 2.0 * one_way_delay_s
+    f = np.linspace(0.0, 10e9, 401)
+    s11 = 0.2 * np.exp(-1j * 2 * np.pi * f * expected_peak_s)
+    net = rf.Network(
+        frequency=rf.Frequency.from_f(f, unit="Hz"),
+        s=s11.reshape(-1, 1, 1),
+        z0=50.0,
+    )
+
+    t, z = tdr_impedance_response(net, 0, 0, z_ref_ohms=50.0, window="hamming")
+    peak_s = float(t[np.argmax(np.abs(z - 50.0))])
+
+    assert t[0] == pytest.approx(0.0)
+    assert peak_s == pytest.approx(expected_peak_s, abs=0.5e-9)
+    # Guard against the old mid-window offset (~T/2 ≈ 20 ns here).
+    assert peak_s < 15e-9
