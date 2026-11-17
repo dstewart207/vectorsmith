@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 from PyQt6.QtCore import QSettings, Qt
 from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
@@ -20,13 +21,19 @@ from PyQt6.QtWidgets import (
 )
 
 from vectorsmith.compare import align_networks, format_freq_span
+from vectorsmith.exports import export_marker_csv, export_touchstone, export_trace_csv
 from vectorsmith.loader import is_touchstone_path
 from vectorsmith.marker import (
+    bandwidth_at_level,
+    find_extrema,
+    find_tdr_features,
+    format_marker_delta,
     format_marker_readout,
     format_tdr_marker_readout,
     freq_range_ghz,
-    value_at_x,
+    marker_delta,
     value_at_frequency,
+    value_at_x,
 )
 from vectorsmith.mixed_mode import ParamDomain, network_for_plot, tdr_trace_label, trace_label
 from vectorsmith.plot_kinds import PlotKind
@@ -38,16 +45,24 @@ from vectorsmith.plots import (
     render_plot,
     status_text,
 )
-from vectorsmith.exports import export_marker_csv, export_trace_csv
+from vectorsmith.qa import analyze_network
 from vectorsmith.resources import app_icon
-from vectorsmith.rf_trace import default_tdr_z_ref_ohms, is_tdr_kind, trace_x_values
+from vectorsmith.rf_trace import (
+    default_tdr_z_ref_ohms,
+    is_tdr_kind,
+    plot_kind_unit,
+    trace_x_values,
+    trace_y_values,
+)
 from vectorsmith.session import Session
+from vectorsmith.ui.export_touchstone_dialog import ExportTouchstoneDialog
 from vectorsmith.ui.file_dock import FileDock
 from vectorsmith.ui.graph_settings_dialog import GraphSettingsDialog
 from vectorsmith.ui.marker_dock import MarkerDock
 from vectorsmith.ui.metadata_dock import MetadataDock
 from vectorsmith.ui.plot_toolbar import PlotToolbar
 from vectorsmith.ui.port_pairing_dialog import PortPairingDialog
+from vectorsmith.ui.qa_dialog import QaDialog
 from vectorsmith.ui.tdr_settings_dialog import TdrSettingsDialog
 from vectorsmith.ui.theme import apply_theme
 from vectorsmith.workspace import (
@@ -122,6 +137,7 @@ class MainWindow(QMainWindow):
         self._plot_bar.port_pairing_requested.connect(self._open_port_pairing)
         self._plot_bar.tdr_settings_requested.connect(self._open_tdr_settings)
         self._marker_dock.marker_changed.connect(self._on_marker_changed)
+        self._marker_dock.search_requested.connect(self._on_marker_search)
 
         self._restore_app_settings()
         self._redraw()
@@ -157,6 +173,9 @@ class MainWindow(QMainWindow):
         export_marker_act = QAction("Export Marker CSV...", self)
         export_marker_act.triggered.connect(self._export_marker_csv)
         file_menu.addAction(export_marker_act)
+        export_touchstone_act = QAction("Export Touchstone...", self)
+        export_touchstone_act.triggered.connect(self._export_touchstone)
+        file_menu.addAction(export_touchstone_act)
         file_menu.addSeparator()
         close_act = QAction("Close selected", self)
         close_act.triggered.connect(self._close_selected)
@@ -186,6 +205,11 @@ class MainWindow(QMainWindow):
         tdr_settings_act = QAction("TDR Settings...", self)
         tdr_settings_act.triggered.connect(self._open_tdr_settings)
         options_menu.addAction(tdr_settings_act)
+
+        tools_menu = self.menuBar().addMenu("&Tools")
+        qa_act = QAction("Network QA...", self)
+        qa_act.triggered.connect(self._run_network_qa)
+        tools_menu.addAction(qa_act)
 
     def _on_dark_theme_toggle(self, checked: bool) -> None:
         self._dark_theme = checked
@@ -265,6 +289,7 @@ class MainWindow(QMainWindow):
         self._canvas.set_dark_theme(self._dark_theme)
         self._plot_bar.refresh_traces(self._session)
         self._plot_bar.restore_snapshot(data.get("toolbar", {}))
+        self._marker_dock.sync_from_session(self._session)
         self._last_dir = str(Path(path).parent)
         self._refresh_all()
         if errors:
@@ -283,11 +308,6 @@ class MainWindow(QMainWindow):
         self._canvas.figure.savefig(path)
         self._last_dir = str(Path(path).parent)
 
-    def _current_marker_x(self) -> float | None:
-        if not self._session.marker_enabled:
-            return None
-        return self._session.marker_freq_ghz
-
     def _export_trace_csv(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
             self,
@@ -303,9 +323,8 @@ class MainWindow(QMainWindow):
         self._last_dir = str(Path(path).parent)
 
     def _export_marker_csv(self) -> None:
-        marker_x = self._current_marker_x()
-        if marker_x is None:
-            QMessageBox.information(self, "Export Marker CSV", "Enable the marker first.")
+        if not self._session.markers_enabled or not self._session.enabled_markers():
+            QMessageBox.information(self, "Export Marker CSV", "Enable markers first.")
             return
         path, _ = QFileDialog.getSaveFileName(
             self,
@@ -317,9 +336,61 @@ class MainWindow(QMainWindow):
             return
         state = self._plot_bar.plot_state(self._session)
         state.tdr_settings = self._tdr_settings
-        export_marker_csv(path, self._session, state, marker_x)
+        export_marker_csv(
+            path,
+            self._session,
+            state,
+            markers=self._session.enabled_markers(),
+        )
         self._last_dir = str(Path(path).parent)
 
+    def _export_touchstone(self) -> None:
+        idx = self._file_dock.list.currentRow()
+        if idx < 0 or idx >= len(self._session.files):
+            QMessageBox.information(self, "Export Touchstone", "Select a file in the list first.")
+            return
+        lf = self._session.files[idx]
+        dlg = ExportTouchstoneDialog(lf, self)
+        options = dlg.result_options()
+        if options is None:
+            return
+        suggested = str(Path(self._last_dir or str(lf.path.parent)) / f"{lf.path.stem}_export")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Touchstone",
+            suggested,
+            "Touchstone (*.s*p);;All (*.*)",
+        )
+        if not path:
+            return
+        written = export_touchstone(
+            path,
+            lf,
+            domain=options.domain,
+            z0_ohms=options.z0_ohms if options.renormalize else None,
+            keysight_reorder=options.keysight_reorder,
+        )
+        self._last_dir = str(written.parent)
+        self._status.showMessage(f"Wrote {written.name}", 5000)
+
+    def _run_network_qa(self) -> None:
+        idx = self._file_dock.list.currentRow()
+        if idx < 0 or idx >= len(self._session.files):
+            QMessageBox.information(self, "Network QA", "Select a file in the list first.")
+            return
+        lf = self._session.files[idx]
+        state = self._plot_bar.plot_state(self._session)
+        domain = state.domain if state.domain else (lf.domain or ParamDomain.SINGLE_ENDED)
+        net = network_for_plot(
+            lf.network,
+            domain,
+            lf.pairing,
+            lf.keysight_reorder,
+            lf.gmm_cache,
+            lf.gmm_cache_key,
+        )
+        report = analyze_network(net, filename=lf.display_name, domain=domain.value)
+        QaDialog(report, self).exec()
 
     def _add_paths(self, paths: list[Path]) -> None:
         touchstone = [p for p in paths if is_touchstone_path(p)]
@@ -338,7 +409,8 @@ class MainWindow(QMainWindow):
 
     def _close_all(self) -> None:
         self._session.files.clear()
-        self._session.marker_freq_ghz = None
+        self._session.clear_markers()
+        self._marker_dock.sync_from_session(self._session)
         self._refresh_all()
 
     def _on_selection(self) -> None:
@@ -354,6 +426,7 @@ class MainWindow(QMainWindow):
         self._redraw()
 
     def _on_plot_changed(self) -> None:
+        self._update_marker_freq_range()
         self._update_marker_readout()
         self._redraw()
 
@@ -362,25 +435,120 @@ class MainWindow(QMainWindow):
         self._redraw()
 
     def _on_marker_changed(self) -> None:
-        self._session.marker_enabled = self._marker_dock.is_enabled()
-        self._marker_dock.set_enabled(self._session.marker_enabled)
-        if self._session.marker_enabled:
-            self._session.marker_freq_ghz = self._marker_dock.freq_ghz()
-            self._canvas.connect_marker_interaction(
-                self._on_marker_click,
-                self._session.marker_freq_ghz,
-            )
-        else:
-            self._canvas.disconnect_marker_interaction()
+        self._marker_dock.apply_to_session(self._session)
+        self._marker_dock.sync_from_session(self._session)
         self._update_marker_readout()
         self._redraw()
 
-    def _on_marker_click(self, freq_ghz: float) -> None:
+    def _on_marker_click(self, x_value: float, marker_id: int | None = None) -> None:
         state = self._plot_bar.plot_state(self._session)
         if state.kind == PlotKind.SMITH:
             return
-        self._session.marker_freq_ghz = freq_ghz
-        self._marker_dock.set_freq_ghz(freq_ghz)
+        if marker_id is not None:
+            self._session.active_marker_id = marker_id
+            for marker in self._session.markers:
+                if marker.marker_id == marker_id:
+                    marker.x = x_value
+                    break
+        else:
+            self._session.marker_freq_ghz = x_value
+        self._marker_dock.sync_from_session(self._session)
+        self._update_marker_readout()
+        self._redraw()
+
+    def _primary_plot_network(self):
+        vis = self._session.visible_files()
+        if not vis:
+            return None, None, None
+        state = self._plot_bar.plot_state(self._session)
+        state.tdr_settings = self._tdr_settings
+        lf = vis[0]
+        net = network_for_plot(
+            lf.network,
+            state.domain,
+            lf.pairing,
+            lf.keysight_reorder,
+            lf.gmm_cache,
+            lf.gmm_cache_key,
+        )
+        return state, lf, net
+
+    def _on_marker_search(self, mode: str) -> None:
+        state, lf, net = self._primary_plot_network()
+        if state is None or net is None or lf is None:
+            QMessageBox.information(self, "Marker search", "Open a visible file first.")
+            return
+        if state.kind == PlotKind.SMITH:
+            QMessageBox.information(self, "Marker search", "Search is not available on Smith chart.")
+            return
+
+        traces = state.selected_traces()
+        m, n = traces[0]
+        self._session.markers_enabled = True
+
+        if mode in {"tdr_peak", "tdr_step"} or is_tdr_kind(state.kind) and mode in {"min", "max"}:
+            if not is_tdr_kind(state.kind):
+                QMessageBox.information(self, "Marker search", "Switch to TDR Z(t) for TDR find.")
+                return
+            trace = tdr_trace_label(net, m, n, state.domain)
+            z_ref = self._tdr_settings.z_ref_ohms or default_tdr_z_ref_ohms(state.domain.value, trace)
+            kwargs = {
+                "tdr_z_ref_ohms": z_ref,
+                "tdr_window": self._tdr_settings.window,
+                "tdr_pad": self._tdr_settings.pad,
+                "tdr_sample_count": self._tdr_settings.sample_count,
+                "tdr_extrapolate_dc": self._tdr_settings.extrapolate_dc,
+            }
+            x = trace_x_values(net, m, n, state.kind, **kwargs)
+            y = trace_y_values(net, m, n, state.kind, state.unwrap_phase, **kwargs)
+            if mode == "min":
+                mn, _ = find_extrema(x, y)
+                self._session.add_marker(mn.x)
+            elif mode == "max":
+                _, mx = find_extrema(x, y)
+                self._session.add_marker(mx.x)
+            else:
+                features = find_tdr_features(x, y, z_ref_ohms=z_ref)
+                wanted = "peak" if mode == "tdr_peak" else "step"
+                match = next((f for f in features if f.kind == wanted or (wanted == "peak" and f.kind == "valley")), None)
+                if match is None:
+                    QMessageBox.information(self, "Marker search", f"No TDR {wanted} found.")
+                    return
+                self._session.add_marker(match.time_ns)
+        elif mode in {"min", "max"}:
+            x = net.frequency.f / HZ_PER_GHZ
+            y = trace_y_values(net, m, n, state.kind, state.unwrap_phase)
+            mn, mx = find_extrema(x, y)
+            self._session.add_marker(mn.x if mode == "min" else mx.x)
+        elif mode == "bw3db":
+            if state.kind not in {PlotKind.MAG_DB, PlotKind.RETURN_LOSS_DB, PlotKind.INSERTION_LOSS_DB}:
+                QMessageBox.information(
+                    self,
+                    "Marker search",
+                    "−3 dB bandwidth search requires Mag (dB) plot.",
+                )
+                return
+            x = net.frequency.f / HZ_PER_GHZ
+            y = trace_y_values(net, m, n, state.kind, state.unwrap_phase)
+            # Transmission-like: peak max; reflection dips: use min for S11-style.
+            relative = "min" if m == n else "max"
+            bw = bandwidth_at_level(x, y, -3.0, relative_to=relative)
+            if bw is None:
+                QMessageBox.information(self, "Marker search", "Could not find −3 dB crossings.")
+                return
+            self._session.clear_markers()
+            self._session.markers_enabled = True
+            self._session.add_marker(bw.low_x)
+            self._session.add_marker(bw.high_x)
+            self._session.add_marker(bw.peak_x)
+            self._status.showMessage(
+                f"−3 dB BW = {bw.bandwidth:.4g} GHz  (low={bw.low_x:.4g}, high={bw.high_x:.4g})",
+                8000,
+            )
+        else:
+            return
+
+        self._marker_dock.sync_from_session(self._session)
         self._update_marker_readout()
         self._redraw()
 
@@ -391,6 +559,8 @@ class MainWindow(QMainWindow):
             return
         state = self._plot_bar.plot_state(self._session)
         state.tdr_settings = self._tdr_settings
+        traces = state.selected_traces()
+        m, n = traces[0]
         if is_tdr_kind(state.kind):
             self._marker_dock.set_axis("Time:", " ns")
             mins: list[float] = []
@@ -404,15 +574,15 @@ class MainWindow(QMainWindow):
                     lf.gmm_cache,
                     lf.gmm_cache_key,
                 )
-                trace = tdr_trace_label(net, state.m, state.n, state.domain)
+                trace = tdr_trace_label(net, m, n, state.domain)
                 z_ref = self._tdr_settings.z_ref_ohms or default_tdr_z_ref_ohms(
                     state.domain.value, trace
                 )
                 try:
                     x = trace_x_values(
                         net,
-                        state.m,
-                        state.n,
+                        m,
+                        n,
                         state.kind,
                         tdr_z_ref_ohms=z_ref,
                         tdr_window=self._tdr_settings.window,
@@ -428,9 +598,9 @@ class MainWindow(QMainWindow):
                 self._marker_dock.set_freq_range(0.0, 1.0)
                 return
             self._marker_dock.set_freq_range(min(mins), max(maxs))
-            if self._session.marker_freq_ghz is None:
-                self._marker_dock.set_freq_ghz(min(mins))
+            if self._session.marker_freq_ghz is None and self._session.markers_enabled:
                 self._session.marker_freq_ghz = min(mins)
+                self._marker_dock.sync_from_session(self._session)
             return
         self._marker_dock.set_axis("Frequency:", " GHz")
         f_min = float("inf")
@@ -440,73 +610,103 @@ class MainWindow(QMainWindow):
             f_min = min(f_min, lo)
             f_max = max(f_max, hi)
         self._marker_dock.set_freq_range(f_min, f_max)
-        if self._session.marker_freq_ghz is None:
-            self._marker_dock.set_freq_ghz(f_min)
+        if self._session.marker_freq_ghz is None and self._session.markers_enabled:
             self._session.marker_freq_ghz = f_min
+            self._marker_dock.sync_from_session(self._session)
 
     def _update_marker_readout(self) -> None:
-        if not self._session.marker_enabled:
+        if not self._session.markers_enabled:
             self._marker_dock.set_readout("")
             return
         state = self._plot_bar.plot_state(self._session)
         if state.kind == PlotKind.SMITH:
             self._marker_dock.set_readout("Marker not available on Smith chart.")
             return
-        freq = self._session.marker_freq_ghz
-        if freq is None:
+        markers = self._session.enabled_markers()
+        if not markers:
             self._marker_dock.set_readout("")
             return
         vis = self._session.visible_files()
         if not vis:
             self._marker_dock.set_readout("No visible files.")
             return
+        traces = state.selected_traces()
+        m, n = traces[0]
         lines: list[str] = []
-        for lf in vis:
-            domain = state.domain if state.domain else (lf.domain or ParamDomain.SINGLE_ENDED)
-            net = network_for_plot(
-                lf.network,
-                domain,
-                lf.pairing,
-                lf.keysight_reorder,
-                lf.gmm_cache,
-                lf.gmm_cache_key,
-            )
-            if is_tdr_kind(state.kind):
-                trace = tdr_trace_label(net, state.m, state.n, state.domain)
-                z_ref = self._tdr_settings.z_ref_ohms or default_tdr_z_ref_ohms(
-                    state.domain.value, trace
+        x_unit = "ns" if is_tdr_kind(state.kind) else "GHz"
+        y_unit = plot_kind_unit(state.kind)
+        values_by_marker: dict[int, list[float]] = {}
+        for marker in markers:
+            values_by_marker[marker.marker_id] = []
+            for lf in vis:
+                domain = state.domain if state.domain else (lf.domain or ParamDomain.SINGLE_ENDED)
+                net = network_for_plot(
+                    lf.network,
+                    domain,
+                    lf.pairing,
+                    lf.keysight_reorder,
+                    lf.gmm_cache,
+                    lf.gmm_cache_key,
                 )
-                try:
-                    val = value_at_x(
-                        net,
-                        state.m,
-                        state.n,
-                        freq,
-                        state.kind,
-                        state.unwrap_phase,
-                        tdr_z_ref_ohms=z_ref,
-                        tdr_window=self._tdr_settings.window,
-                        tdr_pad=self._tdr_settings.pad,
-                        tdr_sample_count=self._tdr_settings.sample_count,
-                        tdr_extrapolate_dc=self._tdr_settings.extrapolate_dc,
+                if is_tdr_kind(state.kind):
+                    trace = tdr_trace_label(net, m, n, state.domain)
+                    z_ref = self._tdr_settings.z_ref_ohms or default_tdr_z_ref_ohms(
+                        state.domain.value, trace
                     )
-                except Exception as exc:  # noqa: BLE001
-                    lines.append(f"{lf.display_name}  {trace}: {exc}")
-                    continue
-                lines.append(format_tdr_marker_readout(lf.display_name, trace, freq, val))
-            else:
-                trace = trace_label(net, state.m, state.n, state.domain)
-                val = value_at_frequency(
-                    net,
-                    state.m,
-                    state.n,
-                    freq,
-                    state.kind,
-                    state.unwrap_phase,
-                )
-                lines.append(
-                    format_marker_readout(lf.display_name, trace, freq, val, state.kind)
-                )
+                    try:
+                        val = value_at_x(
+                            net,
+                            m,
+                            n,
+                            marker.x,
+                            state.kind,
+                            state.unwrap_phase,
+                            tdr_z_ref_ohms=z_ref,
+                            tdr_window=self._tdr_settings.window,
+                            tdr_pad=self._tdr_settings.pad,
+                            tdr_sample_count=self._tdr_settings.sample_count,
+                            tdr_extrapolate_dc=self._tdr_settings.extrapolate_dc,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        lines.append(f"{marker.label}  {lf.display_name}  {trace}: {exc}")
+                        continue
+                    values_by_marker[marker.marker_id].append(val)
+                    lines.append(
+                        format_tdr_marker_readout(
+                            lf.display_name, trace, marker.x, val, marker_label=marker.label
+                        )
+                    )
+                else:
+                    for tm, tn in traces:
+                        trace = trace_label(net, tm, tn, state.domain)
+                        val = value_at_frequency(
+                            net,
+                            tm,
+                            tn,
+                            marker.x,
+                            state.kind,
+                            state.unwrap_phase,
+                        )
+                        if tm == m and tn == n:
+                            values_by_marker[marker.marker_id].append(val)
+                        lines.append(
+                            format_marker_readout(
+                                lf.display_name,
+                                trace,
+                                marker.x,
+                                val,
+                                state.kind,
+                                marker_label=marker.label,
+                            )
+                        )
+
+        if len(markers) >= 2:
+            a, b = markers[0], markers[1]
+            ya = values_by_marker.get(a.marker_id, [np.nan])[0]
+            yb = values_by_marker.get(b.marker_id, [np.nan])[0]
+            if np.isfinite(ya) and np.isfinite(yb):
+                delta = marker_delta(a.x, ya, b.x, yb, x_unit=x_unit, y_unit=y_unit)
+                lines.append(format_marker_delta(delta, a.label, b.label))
         self._marker_dock.set_readout("\n".join(lines))
 
     def _open_port_pairing(self) -> None:
@@ -540,6 +740,7 @@ class MainWindow(QMainWindow):
         self._update_marker_freq_range()
         self._sync_freq_scrollbar()
         self._on_selection()
+        self._marker_dock.sync_from_session(self._session)
         self._update_marker_readout()
         self._redraw()
 
@@ -567,25 +768,24 @@ class MainWindow(QMainWindow):
         state.freq_window_start_ghz = self._freq_scroll.value() / SCROLL_UNITS_PER_GHZ
         state.graph_settings = self._graph_settings
         state.tdr_settings = self._tdr_settings
-        draw_marker = (
-            self._session.marker_enabled
-            and self._session.marker_freq_ghz is not None
-            and state.kind != PlotKind.SMITH
-            and not is_tdr_kind(state.kind)
-        )
+        markers = self._session.enabled_markers()
+        draw_marker = bool(markers) and state.kind != PlotKind.SMITH
         warn = render_plot(
             self._session,
             state,
             self._canvas.figure,
             draw_marker=draw_marker,
             marker_freq_ghz=self._session.marker_freq_ghz,
+            markers=markers if draw_marker else None,
+            active_marker_id=self._session.active_marker_id,
             dark_theme=self._dark_theme,
         )
         self._canvas.clear_and_draw()
-        if self._session.marker_enabled and state.kind != PlotKind.SMITH:
+        if self._session.markers_enabled and state.kind != PlotKind.SMITH:
             self._canvas.connect_marker_interaction(
                 self._on_marker_click,
-                self._session.marker_freq_ghz,
+                markers=[(m.marker_id, m.x) for m in markers],
+                active_marker_id=self._session.active_marker_id,
             )
         else:
             self._canvas.disconnect_marker_interaction()
@@ -612,6 +812,9 @@ class MainWindow(QMainWindow):
                 span = format_freq_span(aligned.f_min_hz, aligned.f_max_hz)
 
         base = status_text(self._session, npts, state.domain)
+        traces = state.selected_traces()
+        if len(traces) > 1:
+            base += f" | {len(traces)} traces"
         if span:
             base += f" | {span}"
         if warn:

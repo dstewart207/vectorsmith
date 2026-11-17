@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import skrf as rf
@@ -11,7 +11,7 @@ from matplotlib.ticker import AutoLocator, AutoMinorLocator, LogLocator, Multipl
 from matplotlib.transforms import blended_transform_factory
 
 from vectorsmith.compare import align_networks
-from vectorsmith.marker import value_at_frequency
+from vectorsmith.marker import value_at_frequency, value_at_x
 from vectorsmith.mixed_mode import (
     ParamDomain,
     network_for_plot,
@@ -29,7 +29,8 @@ from vectorsmith.rf_trace import (
     trace_x_values,
     trace_y_values,
 )
-from vectorsmith.session import LoadedFile, Session
+from vectorsmith.session import LoadedFile, PlotMarker, Session
+
 MAX_FREQ_WINDOW_GHZ = 250.0
 TARGET_FREQ_MAJOR_INTERVALS = 8
 MAJOR_DB = 10.0
@@ -42,6 +43,17 @@ Y_MARGIN_FRAC = 0.05
 LEGEND_POS_ATTR = "_vectorsmith_legend_loc"
 MARKER_LABEL_POS_ATTR = "_vectorsmith_marker_label_pos"
 MARKER_LABEL_GID = "vectorsmith_marker_label"
+LINESTYLES = ("-", "--", "-.", ":")
+TRACE_COLORS = (
+    "#1f77b4",
+    "#ff7f0e",
+    "#2ca02c",
+    "#d62728",
+    "#9467bd",
+    "#8c564b",
+    "#e377c2",
+    "#7f7f7f",
+)
 
 
 @dataclass
@@ -70,6 +82,7 @@ class PlotState:
     kind: PlotKind = PlotKind.MAG_DB
     m: int = 0
     n: int = 0
+    traces: list[tuple[int, int]] = field(default_factory=list)
     unwrap_phase: bool = False
     freq_log: bool = False
     domain: ParamDomain = ParamDomain.SINGLE_ENDED
@@ -79,6 +92,18 @@ class PlotState:
     tdr_settings: TdrSettings | None = None
     comparison_enabled: bool = False
     reference_index: int = 0
+
+    def selected_traces(self) -> list[tuple[int, int]]:
+        if self.traces:
+            unique: list[tuple[int, int]] = []
+            seen: set[tuple[int, int]] = set()
+            for mn in self.traces:
+                pair = (int(mn[0]), int(mn[1]))
+                if pair not in seen:
+                    seen.add(pair)
+                    unique.append(pair)
+            return unique or [(self.m, self.n)]
+        return [(self.m, self.n)]
 
 
 @dataclass(frozen=True)
@@ -249,6 +274,24 @@ def resolve_trace_color(lf: LoadedFile, mode: str, dark_theme: bool, multi_file:
     return resolve_line_color(mode, dark_theme)
 
 
+def resolve_series_style(
+    lf: LoadedFile,
+    mode: str,
+    dark_theme: bool,
+    *,
+    multi_file: bool,
+    multi_trace: bool,
+    trace_index: int,
+) -> tuple[str, str]:
+    """Return (color, linestyle) for a file/trace series."""
+    if multi_file and multi_trace:
+        color = lf.color or resolve_line_color(mode, dark_theme)
+        return color, LINESTYLES[trace_index % len(LINESTYLES)]
+    if multi_trace:
+        return TRACE_COLORS[trace_index % len(TRACE_COLORS)], "-"
+    return resolve_trace_color(lf, mode, dark_theme, multi_file), "-"
+
+
 def _make_draggable(artist) -> None:
     if hasattr(artist, "set_draggable"):
         artist.set_draggable(True)
@@ -280,8 +323,8 @@ def _marker_label_position(figure: Figure) -> tuple[float, float] | None:
     return getattr(figure, MARKER_LABEL_POS_ATTR, None)
 
 
-def _default_marker_label_offset(marker_freq_ghz: float, x_min: float, x_max: float) -> tuple[str, int]:
-    if marker_freq_ghz > (x_min + x_max) / 2.0:
+def _default_marker_label_offset(marker_x: float, x_min: float, x_max: float) -> tuple[str, int]:
+    if marker_x > (x_min + x_max) / 2.0:
         return "right", -6
     return "left", 6
 
@@ -331,10 +374,11 @@ def _plot_trace(
     color: str,
     label: str,
     unwrap: bool,
+    linestyle: str = "-",
 ) -> None:
     f_ghz = network.frequency.f / HZ_PER_GHZ
     y = trace_y_values(network, m, n, kind, unwrap)
-    ax.plot(f_ghz, y, color=color, label=label)
+    ax.plot(f_ghz, y, color=color, label=label, linestyle=linestyle)
     ax.set_ylabel(plot_kind_ylabel(kind))
 
 
@@ -348,57 +392,134 @@ def _format_marker_value(value: float, kind: PlotKind) -> str:
     return f"{value:.4g}{suffix}"
 
 
-def draw_frequency_markers(
+def _tdr_kwargs(state: PlotState, net: rf.Network, m: int, n: int) -> dict:
+    tdr = state.tdr_settings or TdrSettings()
+    trace = tdr_trace_label(net, m, n, state.domain)
+    z_ref = tdr.z_ref_ohms or default_tdr_z_ref_ohms(state.domain.value, trace)
+    return {
+        "tdr_z_ref_ohms": z_ref,
+        "tdr_window": tdr.window,
+        "tdr_pad": tdr.pad,
+        "tdr_sample_count": tdr.sample_count,
+        "tdr_extrapolate_dc": tdr.extrapolate_dc,
+    }
+
+
+def draw_x_markers(
     ax,
     figure: Figure,
     plot_nets: list[tuple[LoadedFile, rf.Network]],
     state: PlotState,
-    marker_freq_ghz: float,
+    markers: list[PlotMarker],
     *,
+    x_unit: str,
     dark_theme: bool = False,
+    active_marker_id: int | None = None,
+    primary_mn: tuple[int, int] | None = None,
 ) -> None:
+    """Draw one or more vertical markers for frequency or TDR plots."""
+    if not markers:
+        return
     marker_line_color = "#f0f3f6" if dark_theme else "#666666"
-    ax.axvline(
-        marker_freq_ghz,
-        color=marker_line_color,
-        linestyle="--",
-        linewidth=1.0,
-        alpha=0.85,
-        zorder=5,
-    )
-    label_lines = [f"{marker_freq_ghz:.4g} GHz"]
-    for lf, net in plot_nets:
-        y = value_at_frequency(
-            net,
-            state.m,
-            state.n,
-            marker_freq_ghz,
-            state.kind,
-            state.unwrap_phase,
+    active_color = "#ffcc66" if dark_theme else "#c45c26"
+    m_primary, n_primary = primary_mn or state.selected_traces()[0]
+    label_lines: list[str] = []
+    for marker in markers:
+        is_active = marker.marker_id == active_marker_id
+        ax.axvline(
+            marker.x,
+            color=active_color if is_active else marker_line_color,
+            linestyle="-" if is_active else "--",
+            linewidth=1.2 if is_active else 1.0,
+            alpha=0.95 if is_active else 0.75,
+            zorder=5,
         )
-        ax.plot(
-            [marker_freq_ghz],
-            [y],
-            "o",
-            color=lf.color or "C3",
-            markersize=8,
-            zorder=6,
-        )
-        label = _format_marker_value(y, state.kind)
-        if len(plot_nets) > 1:
-            label = f"{lf.display_name}: {label}"
-        label_lines.append(label)
+        label_lines.append(f"{marker.label}: {marker.x:.4g} {x_unit}")
+        for lf, net in plot_nets:
+            if is_tdr_kind(state.kind):
+                kwargs = _tdr_kwargs(state, net, m_primary, n_primary)
+                y = value_at_x(
+                    net,
+                    m_primary,
+                    n_primary,
+                    marker.x,
+                    state.kind,
+                    state.unwrap_phase,
+                    **kwargs,
+                )
+            else:
+                y = value_at_frequency(
+                    net,
+                    m_primary,
+                    n_primary,
+                    marker.x,
+                    state.kind,
+                    state.unwrap_phase,
+                )
+            ax.plot(
+                [marker.x],
+                [y],
+                "o",
+                color=lf.color or "C3",
+                markersize=8 if is_active else 6,
+                zorder=6,
+            )
+            value_label = _format_marker_value(y, state.kind)
+            if len(plot_nets) > 1:
+                value_label = f"{lf.display_name}: {value_label}"
+            if len(markers) > 1:
+                value_label = f"{marker.label} {value_label}"
+            label_lines.append(value_label)
+
+    # Keep annotation compact: show active marker first, then others briefly.
+    if len(markers) > 1 and active_marker_id is not None:
+        active = next((m for m in markers if m.marker_id == active_marker_id), markers[0])
+        compact = [f"{active.label}: {active.x:.4g} {x_unit}"]
+        for lf, net in plot_nets:
+            if is_tdr_kind(state.kind):
+                kwargs = _tdr_kwargs(state, net, m_primary, n_primary)
+                y = value_at_x(
+                    net,
+                    m_primary,
+                    n_primary,
+                    active.x,
+                    state.kind,
+                    state.unwrap_phase,
+                    **kwargs,
+                )
+            else:
+                y = value_at_frequency(
+                    net,
+                    m_primary,
+                    n_primary,
+                    active.x,
+                    state.kind,
+                    state.unwrap_phase,
+                )
+            value_label = _format_marker_value(y, state.kind)
+            if len(plot_nets) > 1:
+                value_label = f"{lf.display_name}: {value_label}"
+            compact.append(value_label)
+        if len(markers) > 1:
+            compact.append(f"+{len(markers) - 1} more marker(s)")
+        label_lines = compact
 
     text_color = "#f0f3f6" if dark_theme else "#111111"
     box_face = "#1f2329" if dark_theme else "white"
     box_edge = "#8b949e" if dark_theme else "#666666"
     x_min, x_max = ax.get_xlim()
+    anchor = markers[0].x
+    if active_marker_id is not None:
+        for marker in markers:
+            if marker.marker_id == active_marker_id:
+                anchor = marker.x
+                break
     saved_position = _marker_label_position(figure)
     if saved_position is None:
-        ha, x_offset = _default_marker_label_offset(marker_freq_ghz, x_min, x_max)
+        ha, x_offset = _default_marker_label_offset(anchor, x_min, x_max)
         marker_label = ax.annotate(
             "\n".join(label_lines),
-            xy=(marker_freq_ghz, 0.98),
+            xy=(anchor, 0.98),
             xycoords=blended_transform_factory(ax.transData, ax.transAxes),
             xytext=(x_offset, -6),
             textcoords="offset points",
@@ -436,6 +557,28 @@ def draw_frequency_markers(
     _make_draggable(marker_label)
 
 
+def draw_frequency_markers(
+    ax,
+    figure: Figure,
+    plot_nets: list[tuple[LoadedFile, rf.Network]],
+    state: PlotState,
+    marker_freq_ghz: float,
+    *,
+    dark_theme: bool = False,
+) -> None:
+    """Backward-compatible single-marker drawer."""
+    draw_x_markers(
+        ax,
+        figure,
+        plot_nets,
+        state,
+        [PlotMarker(marker_id=1, x=marker_freq_ghz)],
+        x_unit="GHz",
+        dark_theme=dark_theme,
+        active_marker_id=1,
+    )
+
+
 def render_plot(
     session: Session,
     state: PlotState,
@@ -443,6 +586,8 @@ def render_plot(
     *,
     draw_marker: bool = False,
     marker_freq_ghz: float | None = None,
+    markers: list[PlotMarker] | None = None,
+    active_marker_id: int | None = None,
     dark_theme: bool = False,
 ) -> str | None:
     _capture_draggable_positions(figure)
@@ -477,43 +622,43 @@ def render_plot(
     if aligned.warning:
         warning_parts.append(aligned.warning)
 
+    selected = state.selected_traces()
+    multi_file = len(plot_nets) > 1
+    multi_trace = len(selected) > 1
+    draw_list = markers
+    if draw_list is None and draw_marker and marker_freq_ghz is not None:
+        draw_list = [PlotMarker(marker_id=1, x=marker_freq_ghz)]
+
     if is_tdr_kind(state.kind):
         ax = figure.add_subplot(111)
         _apply_plot_theme(ax, figure, dark_theme)
-        if not is_reflection_trace(state.m, state.n):
+        reflection_traces = [(m, n) for m, n in selected if is_reflection_trace(m, n)]
+        if not reflection_traces:
             ax.text(0.5, 0.5, "TDR requires a reflection trace", ha="center", va="center")
             ax.set_axis_off()
             return "TDR requires a reflection trace"
         tdr = state.tdr_settings or TdrSettings()
-        multi_file = len(plot_nets) > 1
         for (lf, _), net in zip(plot_nets, aligned.networks, strict=True):
-            trace = tdr_trace_label(net, state.m, state.n, state.domain)
-            z_ref = tdr.z_ref_ohms or default_tdr_z_ref_ohms(state.domain.value, trace)
-            x = trace_x_values(
-                net,
-                state.m,
-                state.n,
-                state.kind,
-                tdr_z_ref_ohms=z_ref,
-                tdr_window=tdr.window,
-                tdr_pad=tdr.pad,
-                tdr_sample_count=tdr.sample_count,
-                tdr_extrapolate_dc=tdr.extrapolate_dc,
-            )
-            y = trace_y_values(
-                net,
-                state.m,
-                state.n,
-                state.kind,
-                state.unwrap_phase,
-                tdr_z_ref_ohms=z_ref,
-                tdr_window=tdr.window,
-                tdr_pad=tdr.pad,
-                tdr_sample_count=tdr.sample_count,
-                tdr_extrapolate_dc=tdr.extrapolate_dc,
-            )
-            line_color = resolve_trace_color(lf, state.line_color, dark_theme, multi_file)
-            ax.plot(x, y, color=line_color, label=f"{lf.display_name} ({trace})")
+            for trace_index, (m, n) in enumerate(reflection_traces):
+                trace = tdr_trace_label(net, m, n, state.domain)
+                kwargs = _tdr_kwargs(state, net, m, n)
+                x = trace_x_values(net, m, n, state.kind, **kwargs)
+                y = trace_y_values(net, m, n, state.kind, state.unwrap_phase, **kwargs)
+                color, linestyle = resolve_series_style(
+                    lf,
+                    state.line_color,
+                    dark_theme,
+                    multi_file=multi_file,
+                    multi_trace=multi_trace,
+                    trace_index=trace_index,
+                )
+                ax.plot(
+                    x,
+                    y,
+                    color=color,
+                    linestyle=linestyle,
+                    label=f"{lf.display_name} ({trace})",
+                )
         ax.set_xlabel("Time (ns)")
         ax.set_ylabel(plot_kind_ylabel(state.kind))
         if tdr.show_distance:
@@ -530,23 +675,53 @@ def render_plot(
                 tdr.time_max_ns if tdr.time_max_ns is not None else right,
             )
         _style_grid(ax)
+        if draw_list:
+            aligned_nets = [
+                (lf, net) for (lf, _), net in zip(plot_nets, aligned.networks, strict=True)
+            ]
+            draw_x_markers(
+                ax,
+                figure,
+                aligned_nets,
+                state,
+                draw_list,
+                x_unit="ns",
+                dark_theme=dark_theme,
+                active_marker_id=active_marker_id,
+                primary_mn=reflection_traces[0],
+            )
         legend = ax.legend(loc=_legend_location(figure), fontsize=8)
         _make_draggable(legend)
     elif state.kind == PlotKind.SMITH:
         ax = figure.add_subplot(111)
         _apply_plot_theme(ax, figure, dark_theme)
         title_net = aligned.networks[0]
-        multi_file = len(plot_nets) > 1
         for (lf, _), net in zip(plot_nets, aligned.networks, strict=True):
-            line_color = resolve_trace_color(lf, state.line_color, dark_theme, multi_file)
-            net.plot_s_smith(m=state.m, n=state.n, ax=ax, color=line_color, label=lf.display_name)
+            for trace_index, (m, n) in enumerate(selected):
+                color, _ = resolve_series_style(
+                    lf,
+                    state.line_color,
+                    dark_theme,
+                    multi_file=multi_file,
+                    multi_trace=multi_trace,
+                    trace_index=trace_index,
+                )
+                label = (
+                    f"{lf.display_name} ({trace_label(net, m, n, state.domain)})"
+                    if multi_trace or multi_file
+                    else lf.display_name
+                )
+                net.plot_s_smith(m=m, n=n, ax=ax, color=color, label=label)
         smith_limits = compute_smith_limits(aligned.networks)
         if smith_limits is not None:
             ax.set_xlim(smith_limits.xmin, smith_limits.xmax)
             ax.set_ylim(smith_limits.ymin, smith_limits.ymax)
         legend = ax.legend(loc=_legend_location(figure), fontsize=8)
         _make_draggable(legend)
-        ax.set_title(trace_label(title_net, state.m, state.n, state.domain))
+        if len(selected) == 1:
+            ax.set_title(trace_label(title_net, selected[0][0], selected[0][1], state.domain))
+        else:
+            ax.set_title(f"{len(selected)} traces")
         _style_grid(ax)
     else:
         ax = figure.add_subplot(111)
@@ -559,49 +734,61 @@ def render_plot(
             freq_window_start_ghz=state.freq_window_start_ghz,
             graph_settings=state.graph_settings,
         )
-        multi_file = len(plot_nets) > 1
         for (lf, _), net in zip(plot_nets, aligned.networks, strict=True):
-            trace = trace_label(net, state.m, state.n, state.domain)
-            line_color = resolve_trace_color(lf, state.line_color, dark_theme, multi_file)
-            _plot_trace(
-                ax,
-                net,
-                state.m,
-                state.n,
-                state.kind,
-                line_color,
-                f"{lf.display_name} ({trace})",
-                state.unwrap_phase,
-            )
+            for trace_index, (m, n) in enumerate(selected):
+                trace = trace_label(net, m, n, state.domain)
+                color, linestyle = resolve_series_style(
+                    lf,
+                    state.line_color,
+                    dark_theme,
+                    multi_file=multi_file,
+                    multi_trace=multi_trace,
+                    trace_index=trace_index,
+                )
+                _plot_trace(
+                    ax,
+                    net,
+                    m,
+                    n,
+                    state.kind,
+                    color,
+                    f"{lf.display_name} ({trace})",
+                    state.unwrap_phase,
+                    linestyle=linestyle,
+                )
         if state.comparison_enabled and len(aligned.networks) > 1:
             ref_idx = min(max(state.reference_index, 0), len(aligned.networks) - 1)
             ref = aligned.networks[ref_idx]
             ref_file = plot_nets[ref_idx][0]
-            ref_y = trace_y_values(ref, state.m, state.n, state.kind, state.unwrap_phase)
             for idx, ((lf, _), net) in enumerate(zip(plot_nets, aligned.networks, strict=True)):
                 if idx == ref_idx:
                     continue
-                trace = trace_label(net, state.m, state.n, state.domain)
-                y = trace_y_values(net, state.m, state.n, state.kind, state.unwrap_phase)
-                ax.plot(
-                    net.frequency.f / HZ_PER_GHZ,
-                    y - ref_y,
-                    linestyle="--",
-                    label=f"{lf.display_name} - {ref_file.display_name} ({trace})",
-                )
+                for m, n in selected:
+                    trace = trace_label(net, m, n, state.domain)
+                    y = trace_y_values(net, m, n, state.kind, state.unwrap_phase)
+                    ref_y = trace_y_values(ref, m, n, state.kind, state.unwrap_phase)
+                    ax.plot(
+                        net.frequency.f / HZ_PER_GHZ,
+                        y - ref_y,
+                        linestyle="--",
+                        label=f"{lf.display_name} - {ref_file.display_name} ({trace})",
+                    )
         if limits is not None:
             _apply_axis_limits(ax, limits, state.kind, state.freq_log)
-        if draw_marker and marker_freq_ghz is not None:
+        if draw_list:
             aligned_nets = [
                 (lf, net) for (lf, _), net in zip(plot_nets, aligned.networks, strict=True)
             ]
-            draw_frequency_markers(
+            draw_x_markers(
                 ax,
                 figure,
                 aligned_nets,
                 state,
-                marker_freq_ghz,
+                draw_list,
+                x_unit="GHz",
                 dark_theme=dark_theme,
+                active_marker_id=active_marker_id,
+                primary_mn=selected[0],
             )
         legend = ax.legend(loc=_legend_location(figure), fontsize=8)
         _make_draggable(legend)

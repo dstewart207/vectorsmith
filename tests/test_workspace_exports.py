@@ -33,12 +33,16 @@ def _session_with_fixture() -> Session:
 
 def test_workspace_json_round_trip(tmp_path):
     session = _session_with_fixture()
+    session.markers_enabled = True
+    session.clear_markers()
+    session.add_marker(1.25)
+    session.add_marker(1.75)
     graph = GraphSettings(x_min_ghz=1.0, mag_y_min_db=-80.0)
     data = session_to_dict(
         session,
         graph_settings=graph,
         tdr_settings=TdrSettings(z_ref_ohms=75.0),
-        toolbar={"plot_kind": "mag_db"},
+        toolbar={"plot_kind": "mag_db", "traces": [[0, 0], [1, 0]]},
         dark_theme=True,
     )
     path = tmp_path / "workspace.vsmith.json"
@@ -51,6 +55,25 @@ def test_workspace_json_round_trip(tmp_path):
     assert graph_settings_from_dict(loaded["graph_settings"]) == graph
     assert loaded["tdr_settings"]["z_ref_ohms"] == 75.0
     assert loaded["dark_theme"] is True
+    assert loaded["version"] == 2
+    assert restored.markers_enabled is True
+    assert len(restored.markers) == 2
+    assert restored.markers[0].x == 1.25
+    assert restored.markers[1].x == 1.75
+
+
+def test_workspace_legacy_single_marker_restored():
+    restored, errors = session_from_workspace(
+        {
+            "files": [],
+            "marker_enabled": True,
+            "marker_freq_ghz": 2.5,
+        }
+    )
+    assert not errors
+    assert restored.markers_enabled is True
+    assert len(restored.markers) == 1
+    assert restored.markers[0].x == 2.5
 
 
 def test_workspace_missing_file_reports_error():
