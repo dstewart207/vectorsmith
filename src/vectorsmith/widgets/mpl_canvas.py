@@ -27,9 +27,11 @@ class MplCanvasWidget(QWidget):
         layout.addWidget(self.toolbar)
         layout.addWidget(self.canvas)
         self._marker_cids: list[int] = []
-        self._marker_callback: Callable[[float], None] | None = None
-        self._marker_freq_ghz: float | None = None
+        self._marker_callback: Callable[[float, int | None], None] | None = None
+        self._marker_xs: list[tuple[int, float]] = []  # (marker_id, x)
+        self._active_marker_id: int | None = None
         self._marker_dragging = False
+        self._drag_marker_id: int | None = None
         self._toolbar_icons = {
             action: action.icon()
             for action in self.toolbar.actions()
@@ -50,15 +52,30 @@ class MplCanvasWidget(QWidget):
 
     def connect_marker_interaction(
         self,
-        callback: Callable[[float], None],
-        marker_freq_ghz: float | None,
+        callback: Callable[..., None],
+        marker_freq_ghz: float | None = None,
+        *,
+        markers: list[tuple[int, float]] | None = None,
+        active_marker_id: int | None = None,
     ) -> None:
+        """
+        Connect click/drag marker interaction.
+
+        callback(x, marker_id=None) — marker_id is set when dragging an existing marker.
+        """
+        marker_list = markers
+        if marker_list is None and marker_freq_ghz is not None:
+            marker_list = [(active_marker_id or 1, marker_freq_ghz)]
+        marker_list = marker_list or []
+
         if self._marker_cids and self._marker_callback == callback:
-            self._marker_freq_ghz = marker_freq_ghz
+            self._marker_xs = list(marker_list)
+            self._active_marker_id = active_marker_id
             return
         self.disconnect_marker_interaction()
         self._marker_callback = callback
-        self._marker_freq_ghz = marker_freq_ghz
+        self._marker_xs = list(marker_list)
+        self._active_marker_id = active_marker_id
         self._marker_cids = [
             self.canvas.mpl_connect("button_press_event", self._on_marker_press),
             self.canvas.mpl_connect("motion_notify_event", self._on_marker_motion),
@@ -70,8 +87,10 @@ class MplCanvasWidget(QWidget):
             self.canvas.mpl_disconnect(cid)
         self._marker_cids = []
         self._marker_callback = None
-        self._marker_freq_ghz = None
+        self._marker_xs = []
+        self._active_marker_id = None
         self._marker_dragging = False
+        self._drag_marker_id = None
 
     def connect_marker_click(self, callback: Callable[[float], None]) -> None:
         self.connect_marker_interaction(callback, None)
@@ -82,19 +101,25 @@ class MplCanvasWidget(QWidget):
     def _on_marker_press(self, event) -> None:
         if not self._marker_event_is_active(event):
             return
-        if not self._is_near_marker_line(event):
-            self._marker_dragging = False
+        near_id = self._nearest_marker_id(event)
+        if near_id is None:
+            # Click elsewhere moves the active marker.
+            self._marker_dragging = True
+            self._drag_marker_id = self._active_marker_id
+            self._emit_marker_frequency(event, self._drag_marker_id)
             return
         self._marker_dragging = True
-        self._emit_marker_frequency(event)
+        self._drag_marker_id = near_id
+        self._emit_marker_frequency(event, near_id)
 
     def _on_marker_motion(self, event) -> None:
         if not self._marker_dragging or not self._marker_event_is_active(event):
             return
-        self._emit_marker_frequency(event)
+        self._emit_marker_frequency(event, self._drag_marker_id)
 
     def _on_marker_release(self, _event) -> None:
         self._marker_dragging = False
+        self._drag_marker_id = None
 
     def _marker_event_is_active(self, event) -> bool:
         if self._marker_callback is None:
@@ -106,20 +131,35 @@ class MplCanvasWidget(QWidget):
         mode = getattr(self.toolbar, "mode", "") or ""
         return not bool(mode)
 
-    def _is_near_marker_line(self, event) -> bool:
-        if self._marker_freq_ghz is None or event.inaxes is None:
-            return False
-        marker_x, _ = event.inaxes.transData.transform((self._marker_freq_ghz, 0.0))
-        return abs(event.x - marker_x) <= MARKER_PICK_TOLERANCE_PX
+    def _nearest_marker_id(self, event) -> int | None:
+        if event.inaxes is None or not self._marker_xs:
+            return None
+        best_id = None
+        best_dist = None
+        for marker_id, x in self._marker_xs:
+            marker_px, _ = event.inaxes.transData.transform((x, 0.0))
+            dist = abs(event.x - marker_px)
+            if dist <= MARKER_PICK_TOLERANCE_PX and (best_dist is None or dist < best_dist):
+                best_dist = dist
+                best_id = marker_id
+        return best_id
 
-    def _emit_marker_frequency(self, event) -> None:
+    def _emit_marker_frequency(self, event, marker_id: int | None) -> None:
         if self._marker_callback is None or event.inaxes is None or event.xdata is None:
             return
         xmin, xmax = event.inaxes.get_xlim()
         lo, hi = sorted((float(xmin), float(xmax)))
-        freq_ghz = min(max(float(event.xdata), lo), hi)
-        self._marker_freq_ghz = freq_ghz
-        self._marker_callback(freq_ghz)
+        x_value = min(max(float(event.xdata), lo), hi)
+        if marker_id is not None:
+            self._marker_xs = [
+                (mid, x_value if mid == marker_id else x) for mid, x in self._marker_xs
+            ]
+            self._active_marker_id = marker_id
+        try:
+            self._marker_callback(x_value, marker_id)
+        except TypeError:
+            # Backward-compatible single-arg callbacks.
+            self._marker_callback(x_value)
 
     @staticmethod
     def _tinted_icon(icon: QIcon, color: QColor) -> QIcon:

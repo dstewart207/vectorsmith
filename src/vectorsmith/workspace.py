@@ -12,7 +12,7 @@ from vectorsmith.mixed_mode import ParamDomain
 from vectorsmith.plots import GraphSettings, TdrSettings
 from vectorsmith.session import LoadedFile, PortPairingConfig, Session
 
-WORKSPACE_VERSION = 1
+WORKSPACE_VERSION = 2
 
 
 def graph_settings_to_dict(settings: GraphSettings) -> dict[str, float | None]:
@@ -59,8 +59,14 @@ def session_to_dict(
     return {
         "version": WORKSPACE_VERSION,
         "dark_theme": dark_theme,
-        "marker_enabled": session.marker_enabled,
+        "marker_enabled": session.markers_enabled,
         "marker_freq_ghz": session.marker_freq_ghz,
+        "markers_enabled": session.markers_enabled,
+        "active_marker_id": session.active_marker_id,
+        "markers": [
+            {"marker_id": m.marker_id, "x": m.x, "enabled": m.enabled}
+            for m in session.markers
+        ],
         "graph_settings": graph_settings_to_dict(graph_settings),
         "tdr_settings": tdr_settings_to_dict(tdr_settings),
         "toolbar": toolbar,
@@ -121,6 +127,15 @@ def session_from_workspace(data: dict[str, Any]) -> tuple[Session, list[tuple[Pa
             keysight_reorder=bool(item.get("keysight_reorder", False)),
         )
         session.files.append(lf)
-    session.marker_enabled = bool(data.get("marker_enabled", False))
-    session.marker_freq_ghz = data.get("marker_freq_ghz")
+
+    markers_enabled = bool(data.get("markers_enabled", data.get("marker_enabled", False)))
+    markers = data.get("markers")
+    legacy_x = data.get("marker_freq_ghz")
+    session.set_markers_from_workspace(
+        markers_enabled=markers_enabled,
+        markers=markers if isinstance(markers, list) else None,
+        legacy_x=legacy_x,
+    )
+    if data.get("active_marker_id") is not None and session.markers:
+        session.active_marker_id = int(data["active_marker_id"])
     return session, errors
