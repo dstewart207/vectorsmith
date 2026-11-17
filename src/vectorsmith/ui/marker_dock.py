@@ -96,12 +96,14 @@ class MarkerDock(QDockWidget):
     def _on_active_changed(self, *_args) -> None:
         if self._syncing:
             return
-        # Updating active marker is handled by main window via marker_changed.
+        # Selection must not write the previous spinbox value onto the new marker.
+        self._pending_action = "select"
         self._emit()
 
     def _on_x_changed(self, *_args) -> None:
         if self._syncing:
             return
+        self._pending_action = "move"
         self._emit()
 
     def _on_add(self) -> None:
@@ -207,7 +209,12 @@ class MarkerDock(QDockWidget):
             marker_id = self._marker_list.currentData()
             if marker_id is not None:
                 session.remove_marker(int(marker_id))
-        else:
+        elif action == "select":
+            marker_id = self._marker_list.currentData()
+            if marker_id is not None:
+                session.active_marker_id = int(marker_id)
+            # Intentionally do not write spinbox X onto the newly selected marker.
+        elif action == "move":
             marker_id = self._marker_list.currentData()
             if marker_id is not None:
                 session.active_marker_id = int(marker_id)

@@ -2,11 +2,13 @@ import numpy as np
 
 from vectorsmith.marker import (
     bandwidth_at_level,
+    bandwidth_relative_to,
     find_extrema,
     find_tdr_features,
     format_marker_delta,
     marker_delta,
 )
+from vectorsmith.plot_kinds import PlotKind
 
 
 def test_find_extrema():
@@ -34,6 +36,23 @@ def test_bandwidth_at_level_notch():
     assert bw is not None
     assert abs(bw.peak_x - 3.0) < 1e-6
     assert bw.bandwidth > 0
+
+
+def test_bandwidth_rejects_missing_crossings():
+    x = np.linspace(1.0, 5.0, 101)
+    y = np.full_like(x, -1.0)  # flat; never leaves the -3 dB region of a 0 dB peak
+    assert bandwidth_at_level(x, y, -3.0, relative_to="max") is None
+
+    # Peak at the edge with no opposite-side crossing.
+    y_edge = -(x - 1.0) ** 2
+    assert bandwidth_at_level(x, y_edge, -1.0, relative_to="max") is None
+
+
+def test_bandwidth_relative_to_flips_for_loss_plots():
+    assert bandwidth_relative_to(PlotKind.MAG_DB, 0, 0) == "min"
+    assert bandwidth_relative_to(PlotKind.RETURN_LOSS_DB, 0, 0) == "max"
+    assert bandwidth_relative_to(PlotKind.MAG_DB, 1, 0) == "max"
+    assert bandwidth_relative_to(PlotKind.INSERTION_LOSS_DB, 1, 0) == "min"
 
 
 def test_marker_delta_format():

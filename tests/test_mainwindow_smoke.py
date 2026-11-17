@@ -74,6 +74,38 @@ def test_marker_dock_enable_add_and_search_min():
     window.close()
 
 
+def test_selecting_active_marker_preserves_positions():
+    app = _app()
+    window = MainWindow()
+    _load_fixture(window)
+    session = window._session  # noqa: SLF001
+    dock = window._marker_dock  # noqa: SLF001
+
+    session.markers_enabled = True
+    session.clear_markers()
+    m1 = session.add_marker(1.0)
+    m2 = session.add_marker(2.0)
+    session.active_marker_id = m2.marker_id
+    dock.sync_from_session(session)
+    assert dock.freq_ghz() == 2.0
+
+    # Simulate choosing M1 in the combo without a spinbox edit.
+    idx = dock._marker_list.findData(m1.marker_id)  # noqa: SLF001
+    dock._marker_list.setCurrentIndex(idx)  # noqa: SLF001
+    app.processEvents()
+    # apply_to_session is invoked by marker_changed; call explicitly if signals blocked.
+    if session.active_marker_id != m1.marker_id:
+        dock._pending_action = "select"  # noqa: SLF001
+        dock.apply_to_session(session)
+        dock.sync_from_session(session)
+
+    assert session.active_marker_id == m1.marker_id
+    assert m1.x == 1.0
+    assert m2.x == 2.0
+    assert dock.freq_ghz() == 1.0
+    window.close()
+
+
 def test_export_touchstone_and_qa_menu_actions_exist():
     app = _app()
     window = MainWindow()

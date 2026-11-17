@@ -25,6 +25,7 @@ from vectorsmith.exports import export_marker_csv, export_touchstone, export_tra
 from vectorsmith.loader import is_touchstone_path
 from vectorsmith.marker import (
     bandwidth_at_level,
+    bandwidth_relative_to,
     find_extrema,
     find_tdr_features,
     format_marker_delta,
@@ -530,8 +531,7 @@ class MainWindow(QMainWindow):
                 return
             x = net.frequency.f / HZ_PER_GHZ
             y = trace_y_values(net, m, n, state.kind, state.unwrap_phase)
-            # Transmission-like: peak max; reflection dips: use min for S11-style.
-            relative = "min" if m == n else "max"
+            relative = bandwidth_relative_to(state.kind, m, n)
             bw = bandwidth_at_level(x, y, -3.0, relative_to=relative)
             if bw is None:
                 QMessageBox.information(self, "Marker search", "Could not find −3 dB crossings.")

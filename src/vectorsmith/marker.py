@@ -187,12 +187,24 @@ def bandwidth_at_level(
     while right < len(inside) - 1 and inside[right + 1]:
         right += 1
 
-    low_x = float(x_arr[left])
-    high_x = float(x_arr[right])
-    if left > 0:
-        low_x = _crossing(float(x_arr[left - 1]), float(y_arr[left - 1]), float(x_arr[left]), float(y_arr[left]), threshold)
-    if right < len(x_arr) - 1:
-        high_x = _crossing(float(x_arr[right]), float(y_arr[right]), float(x_arr[right + 1]), float(y_arr[right + 1]), threshold)
+    # Require real crossings on both sides; endpoint-of-sweep defaults are not a BW.
+    if left <= 0 or right >= len(x_arr) - 1:
+        return None
+
+    low_x = _crossing(
+        float(x_arr[left - 1]),
+        float(y_arr[left - 1]),
+        float(x_arr[left]),
+        float(y_arr[left]),
+        threshold,
+    )
+    high_x = _crossing(
+        float(x_arr[right]),
+        float(y_arr[right]),
+        float(x_arr[right + 1]),
+        float(y_arr[right + 1]),
+        threshold,
+    )
 
     return BandwidthResult(
         center_x=0.5 * (low_x + high_x),
@@ -203,6 +215,20 @@ def bandwidth_at_level(
         peak_x=float(x_arr[peak_idx]),
         peak_y=peak_y,
     )
+
+
+def bandwidth_relative_to(kind: PlotKind, m: int, n: int) -> str:
+    """
+    Choose bandwidth search polarity for Mag vs loss plot kinds.
+
+    Mag (dB): reflection notches use min; transmission peaks use max.
+    Return/Insertion Loss are negated Mag, so the polarity flips.
+    """
+    is_loss = kind in {PlotKind.RETURN_LOSS_DB, PlotKind.INSERTION_LOSS_DB}
+    is_reflection = m == n
+    if is_reflection:
+        return "max" if is_loss else "min"
+    return "min" if is_loss else "max"
 
 
 def marker_delta(
